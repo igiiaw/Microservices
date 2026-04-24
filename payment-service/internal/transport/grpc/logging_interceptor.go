@@ -1,4 +1,3 @@
-// payment-service/internal/transport/grpc/logging_interceptor.go
 package grpc
 
 import (
@@ -10,11 +9,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// LoggingUnaryInterceptor logs every unary RPC: method name, duration, and
-// the resulting gRPC status code. It is transport-level concern only —
-// no business data is inspected, so this is safe to apply to every RPC.
-//
-// Signature is fixed by gRPC: it must match grpc.UnaryServerInterceptor.
+// LoggingUnaryInterceptor logs method name, duration, and status code for every RPC.
+// doesn't touch any business data — safe to apply globally.
+// signature is fixed by gRPC, has to match grpc.UnaryServerInterceptor
 func LoggingUnaryInterceptor(
 	ctx context.Context,
 	req interface{},
@@ -23,12 +20,11 @@ func LoggingUnaryInterceptor(
 ) (interface{}, error) {
 	start := time.Now()
 
-	// Call the actual handler. Everything before this line runs "before" the RPC;
-	// everything after runs "after". This is the whole middleware pattern in one call.
+	// everything before this is "before the RPC", everything after is "after"
 	resp, err := handler(ctx, req)
 
 	duration := time.Since(start)
-	code := status.Code(err) // returns codes.OK when err == nil
+	code := status.Code(err) // codes.OK when err == nil
 
 	log.Printf("gRPC %s | %s | %s", info.FullMethod, code, duration)
 

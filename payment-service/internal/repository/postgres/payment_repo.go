@@ -6,7 +6,7 @@ import (
 	"payment-service/internal/domain"
 )
 
-// PaymentRepository is the concrete PostgreSQL adapter for domain.PaymentRepository.
+// PaymentRepository is the PostgreSQL implementation of domain.PaymentRepository
 type PaymentRepository struct {
 	db *sql.DB
 }
@@ -43,4 +43,49 @@ func (r *PaymentRepository) FindByOrderID(orderID string) (*domain.Payment, erro
 		return nil, err
 	}
 	return &p, nil
+}
+
+// ListByStatus returns all payments with the given status.
+// empty status → return everything. empty result is not an error, just returns []
+func (r *PaymentRepository) ListByStatus(status string) ([]*domain.Payment, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status == "" {
+		rows, err = r.db.Query(`
+			SELECT id, order_id, transaction_id, amount, status
+			FROM payments
+		`)
+	} else {
+		rows, err = r.db.Query(`
+			SELECT id, order_id, transaction_id, amount, status
+			FROM payments
+			WHERE status = $1
+		`, status)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	payments := make([]*domain.Payment, 0)
+	for rows.Next() {
+		p := &domain.Payment{}
+		if err := rows.Scan(
+			&p.ID,
+			&p.OrderID,
+			&p.TransactionID,
+			&p.Amount,
+			&p.Status,
+		); err != nil {
+			return nil, err
+		}
+		payments = append(payments, p)
+	}
+	// rows.Err() catches errors that happened mid-iteration, always check it
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return payments, nil
 }

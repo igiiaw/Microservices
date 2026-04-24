@@ -4,13 +4,18 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
+	"google.golang.org/grpc"
 
+	paymentv1 "github.com/igiiaw/ap2-proto-gen/gen/go/payment/v1"
+	"google.golang.org/grpc/reflection"
 	pgRepo "payment-service/internal/repository/postgres"
+	transportGRPC "payment-service/internal/transport/grpc"
 	transportHTTP "payment-service/internal/transport/http"
 	"payment-service/internal/usecase"
 )
@@ -52,19 +57,49 @@ func main() {
 	// ── Composition Root (manual DI) ──────────────────────────────────────────
 	paymentRepo := pgRepo.NewPaymentRepository(db)
 	paymentUseCase := usecase.NewPaymentUseCase(paymentRepo)
-	paymentHandler := transportHTTP.NewPaymentHandler(paymentUseCase)
 
-	// ── Router ────────────────────────────────────────────────────────────────
+	// HTTP delivery (kept for backwards-compat during migration) ─────────────
+	httpHandler := transportHTTP.NewPaymentHandler(paymentUseCase)
 	router := gin.Default()
-	paymentHandler.RegisterRoutes(router)
+	httpHandler.RegisterRoutes(router)
 
-	port := getEnv("PORT", "8081")
-	log.Printf("Payment Service listening on :%s", port)
-	if err := router.Run(":" + port); err != nil {
-		log.Fatalf("server error: %v", err)
+	httpPort := getEnv("PORT", "8081")
+	go func() {
+		log.Printf("Payment Service HTTP listening on :%s", httpPort)
+		if err := router.Run(":" + httpPort); err != nil {
+			log.Fatalf("http server error: %v", err)
+		}
+	}()
+
+	// gRPC delivery ───────────────────────────────────────────────────────────
+	grpcPort := getEnv("GRPC_PORT", "9091")
+	lis, err := net.Listen("tcp", ":"+grpcPort)
+	if err != nil {
+		log.Fatalf("failed to listen on :%s: %v", grpcPort, err)
+	}
+
+	// Logging interceptor added here
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(transportGRPC.LoggingUnaryInterceptor),
+	)
+	paymentv1.RegisterPaymentServiceServer(grpcServer, transportGRPC.NewPaymentServer(paymentUseCase))
+	reflection.Register(grpcServer)
+
+	log.Printf("Payment Service gRPC listening on :%s", grpcPort)
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("grpc server error: %v", err)
 	}
 }
 
+// getEnv is a helper function to read an environment variable or return a default value
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
+// runMigrations applies schema changes idempotently.
 func runMigrations(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS payments (
@@ -76,11 +111,4 @@ func runMigrations(db *sql.DB) error {
 		);
 	`)
 	return err
-}
-
-func getEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }

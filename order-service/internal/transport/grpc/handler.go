@@ -1,4 +1,3 @@
-// order-service/internal/transport/grpc/handler.go
 package grpc
 
 import (
@@ -14,9 +13,7 @@ import (
 	orderv1 "github.com/igiiaw/ap2-proto-gen/gen/go/order/v1"
 )
 
-// OrderServer is the gRPC delivery adapter for the Order Service.
-// It uses the use case for reads (no business logic here) and the event
-// subscriber port for live updates.
+// OrderServer handles gRPC calls for the Order Service
 type OrderServer struct {
 	orderv1.UnimplementedOrderServiceServer
 	uc     *usecase.OrderUseCase
@@ -27,15 +24,14 @@ func NewOrderServer(uc *usecase.OrderUseCase, events domain.OrderEventSubscriber
 	return &OrderServer{uc: uc, events: events}
 }
 
-// SubscribeToOrderUpdates streams real DB-backed status changes for one order.
+// SubscribeToOrderUpdates streams status changes until the order hits a terminal state.
 //
 // Flow:
-//  1. Validate the order exists (DB read via the use case).
-//  2. Send the CURRENT status as the first frame — so late subscribers aren't
-//     left hanging if the terminal transition already happened.
-//  3. Subscribe to the broker and forward every event.
-//  4. Close the stream as soon as the order reaches a terminal state
-//     (Paid / Failed / Cancelled), OR the client disconnects.
+//  1. check the order exists
+//  2. subscribe to broker BEFORE reading current status — avoids missing events in between
+//  3. send current status as the first frame
+//  4. forward events, re-reading from DB each time (broker says when, DB says what)
+//  5. stop when Paid/Failed/Cancelled or client disconnects
 func (s *OrderServer) SubscribeToOrderUpdates(
 	req *orderv1.SubscribeToOrderUpdatesRequest,
 	stream orderv1.OrderService_SubscribeToOrderUpdatesServer,
@@ -45,7 +41,6 @@ func (s *OrderServer) SubscribeToOrderUpdates(
 		return status.Error(codes.InvalidArgument, "order_id is required")
 	}
 
-	// Step 1 — the order must exist. Read goes through the use case.
 	order, err := s.uc.GetOrder(orderID)
 	if err != nil {
 		if errors.Is(err, domain.ErrOrderNotFound) {
@@ -54,37 +49,31 @@ func (s *OrderServer) SubscribeToOrderUpdates(
 		return status.Error(codes.Internal, err.Error())
 	}
 
-	// Step 2 — subscribe BEFORE sending the snapshot, so we can't miss an event
-	// that happens between the read and the subscribe (classic TOCTOU).
+	// subscribe first, then send snapshot — order matters here
 	ch, unsubscribe := s.events.Subscribe(orderID)
 	defer unsubscribe()
 
-	// Step 2b — send the current status as frame #1.
 	if err := stream.Send(toProtoUpdate(order.ID, order.Status)); err != nil {
 		return err
 	}
 	if isTerminal(order.Status) {
-		return nil // already finished — snapshot was the last frame.
+		return nil // already done, snapshot was the last frame
 	}
 
-	// Step 3 — forward events until terminal or client disconnect.
 	ctx := stream.Context()
 	for {
 		select {
 		case <-ctx.Done():
-			// Client went away. gRPC will report this as codes.Canceled upstream.
+			// client disconnected
 			return ctx.Err()
 
 		case evt, ok := <-ch:
 			if !ok {
-				// Broker closed our channel (unsubscribe was called somewhere
-				// else, or server is shutting down).
+				// channel closed, broker shutting down or we unsubscribed
 				return nil
 			}
 
-			// Step 4 — verify against the DB before we send. This is the
-			// "tied to real database status changes" guarantee: the broker
-			// tells us *when* to look, but the DB is the source of truth.
+			// re-read from DB — broker tells us when to look, not what changed
 			fresh, err := s.uc.GetOrder(evt.OrderID)
 			if err != nil {
 				return status.Error(codes.Internal, err.Error())
@@ -99,6 +88,7 @@ func (s *OrderServer) SubscribeToOrderUpdates(
 	}
 }
 
+// isTerminal — order won't change status after these
 func isTerminal(s string) bool {
 	return s == domain.StatusPaid ||
 		s == domain.StatusFailed ||
@@ -113,6 +103,7 @@ func toProtoUpdate(orderID, s string) *orderv1.OrderUpdate {
 	}
 }
 
+// toProtoStatus maps our domain strings to proto enum values
 func toProtoStatus(s string) orderv1.OrderStatus {
 	switch s {
 	case domain.StatusPending:

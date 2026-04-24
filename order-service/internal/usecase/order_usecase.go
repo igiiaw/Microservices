@@ -8,59 +8,57 @@ import (
 	"order-service/internal/domain"
 )
 
-// OrderUseCase orchestrates order workflows.
-// It depends only on domain interfaces (Ports) – never on concrete implementations.
+// OrderUseCase is where the business logic lives.
+// only talks to interfaces — never to concrete DB or HTTP clients directly
 type OrderUseCase struct {
 	repo            domain.OrderRepository
 	paymentClient   domain.PaymentClient
-	idempotencyRepo domain.IdempotencyRepository // may be nil if feature disabled
+	idempotencyRepo domain.IdempotencyRepository // nil if feature not wired in
+	events          domain.OrderEventPublisher   // nil if no broker wired in
 }
 
 func NewOrderUseCase(
 	repo domain.OrderRepository,
 	paymentClient domain.PaymentClient,
 	idempotencyRepo domain.IdempotencyRepository,
+	events domain.OrderEventPublisher,
 ) *OrderUseCase {
 	return &OrderUseCase{
 		repo:            repo,
 		paymentClient:   paymentClient,
 		idempotencyRepo: idempotencyRepo,
+		events:          events,
 	}
 }
 
-// CreateOrder creates a new order and synchronously requests payment authorisation.
-// idempotencyKey may be empty – when provided, duplicate submissions are safely rejected.
+// CreateOrder creates the order and immediately tries to authorize payment.
 func (uc *OrderUseCase) CreateOrder(idempotencyKey, customerID, itemName string, amount int64) (*domain.Order, error) {
-	// --- Bonus: Idempotency check ---
+	// already processed this key? return the original result, no side effects
 	if idempotencyKey != "" && uc.idempotencyRepo != nil {
 		existing, err := uc.idempotencyRepo.FindOrderByKey(idempotencyKey)
 		if err == nil {
-			// Already processed – return the original result without side effects.
 			return existing, nil
 		}
 	}
 
-	// --- Domain validation (business rule: amount > 0) ---
 	order, err := domain.NewOrder(customerID, itemName, amount)
 	if err != nil {
 		return nil, err
 	}
 	order.ID = uuid.New().String()
 
-	// Persist as Pending before calling Payment Service.
+	// save as Pending first — we want a DB record before calling the payment service
 	if err := uc.repo.Save(order); err != nil {
 		return nil, err
 	}
 
-	// --- Call Payment Service (synchronous REST, 2-second timeout enforced by the client) ---
 	_, payErr := uc.paymentClient.AuthorizePayment(order.ID, order.Amount)
 	if payErr != nil {
-		// Mark the order as Failed regardless of whether the cause was a timeout,
-		// network error, or an explicit Declined response.
-		// Design choice: "Failed" is preferred over leaving it "Pending" because
-		// the outcome is deterministic – no payment was authorised.
+		// payment failed for any reason → mark Failed
+		// better than leaving it Pending since no payment was actually authorized
 		order.Status = domain.StatusFailed
-		_ = uc.repo.Update(order) // best-effort status update
+		_ = uc.repo.Update(order) // best-effort, ignore the error
+		uc.publishStatus(order.ID, order.Status)
 		return order, payErr
 	}
 
@@ -68,8 +66,9 @@ func (uc *OrderUseCase) CreateOrder(idempotencyKey, customerID, itemName string,
 	if err := uc.repo.Update(order); err != nil {
 		return nil, err
 	}
+	uc.publishStatus(order.ID, order.Status)
 
-	// --- Bonus: Persist idempotency key after success ---
+	// save the key so future duplicates get this same order back
 	if idempotencyKey != "" && uc.idempotencyRepo != nil {
 		_ = uc.idempotencyRepo.SaveKey(idempotencyKey, order.ID)
 	}
@@ -77,19 +76,17 @@ func (uc *OrderUseCase) CreateOrder(idempotencyKey, customerID, itemName string,
 	return order, nil
 }
 
-// GetOrder retrieves an order by its ID.
 func (uc *OrderUseCase) GetOrder(id string) (*domain.Order, error) {
 	return uc.repo.FindByID(id)
 }
 
-// CancelOrder cancels a Pending order. Business rule: Paid orders cannot be cancelled.
+// CancelOrder cancels a Pending order — domain.Cancel() enforces the rules
 func (uc *OrderUseCase) CancelOrder(id string) (*domain.Order, error) {
 	order, err := uc.repo.FindByID(id)
 	if err != nil {
 		return nil, err
 	}
 
-	// Cancel() enforces the domain invariant.
 	if err := order.Cancel(); err != nil {
 		return nil, err
 	}
@@ -97,15 +94,22 @@ func (uc *OrderUseCase) CancelOrder(id string) (*domain.Order, error) {
 	if err := uc.repo.Update(order); err != nil {
 		return nil, err
 	}
-
+	uc.publishStatus(order.ID, order.Status)
 	return order, nil
 }
 
-// IsCancelConflict returns true when the error is a domain cancellation constraint.
+// IsCancelConflict returns true if the error came from trying to cancel an uncancellable order
 func IsCancelConflict(err error) bool {
 	return errors.Is(err, domain.ErrAlreadyPaid) || errors.Is(err, domain.ErrCannotCancel)
 }
 
 func (uc *OrderUseCase) GetOrdersByCustomerID(customerID string) ([]*domain.Order, error) {
 	return uc.repo.FindByCustomerID(customerID)
+}
+
+// publishStatus is nil-safe — does nothing if no broker is configured
+func (uc *OrderUseCase) publishStatus(orderID, status string) {
+	if uc.events != nil {
+		uc.events.PublishStatusChanged(orderID, status)
+	}
 }

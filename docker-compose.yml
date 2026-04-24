@@ -44,6 +44,7 @@ services:
     container_name: payment-service
     ports:
       - "8081:8081"
+      - "9091:9091"
     environment:
       DB_HOST: payments-db
       DB_PORT: 5432
@@ -51,6 +52,7 @@ services:
       DB_PASSWORD: postgres
       DB_NAME: payments_db
       PORT: 8081
+      GRPC_PORT: 9091
     depends_on:
       payments-db:
         condition: service_healthy
@@ -64,6 +66,7 @@ services:
     container_name: order-service
     ports:
       - "8080:8080"
+      - "9090:9090"
     environment:
       DB_HOST: orders-db
       DB_PORT: 5432
@@ -72,6 +75,8 @@ services:
       DB_NAME: orders_db
       PAYMENT_SERVICE_URL: http://payment-service:8081
       PORT: 8080
+      PAYMENT_GRPC_ADDR: payment-service:9091
+      GRPC_PORT: 9090
     depends_on:
       orders-db:
         condition: service_healthy

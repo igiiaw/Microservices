@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5433:5432"   # exposed on 5433 so it doesn't clash with a local PG
+      - "5433:5432"
     volumes:
       - orders_db_data:/var/lib/postgresql/data
     healthcheck:
@@ -26,7 +26,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5434:5432"   # separate port – separate database, separate ownership
+      - "5434:5432"
     volumes:
       - payments_db_data:/var/lib/postgresql/data
     healthcheck:
@@ -35,8 +35,25 @@ services:
       timeout: 5s
       retries: 10
 
+  # ── RabbitMQ ──────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"     # AMQP protocol
+      - "15672:15672"   # Management UI (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # ── Payment Service ───────────────────────────────────────────────────────
-  # Started before order-service so the inter-service HTTP call can succeed.
   payment-service:
     build:
       context: ./payment-service
@@ -53,8 +70,11 @@ services:
       DB_NAME: payments_db
       PORT: 8081
       GRPC_PORT: 9091
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     depends_on:
       payments-db:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     restart: on-failure
 
@@ -84,6 +104,20 @@ services:
         condition: service_started
     restart: on-failure
 
+  # ── Notification Service ──────────────────────────────────────────────────
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+
 volumes:
   orders_db_data:
   payments_db_data:
+  rabbitmq_data:

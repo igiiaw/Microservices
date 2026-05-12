@@ -47,6 +47,18 @@ func (h *NotificationHandler) Handle(d amqp.Delivery) error {
 		return fmt.Errorf("invalid message body: %w", err)
 	}
 
+	// DLQ DEMO: Simulate a permanent failure.
+	// Triggered by customer_id "fail-demo". Remove before production!
+	if event.CustomerEmail == "customer_fail-dem@example.com" {
+		return fmt.Errorf("SIMULATED ERROR: cannot process order %s", event.OrderID)
+	}
+
+	// DLQ DEMO: Simulate permanent failure for declined payments.
+	// Forces messages to the DLQ. Remove before final submission!
+	if event.Status == "Declined" {
+		return fmt.Errorf("SIMULATED ERROR: cannot send notification for declined order %s", event.OrderID)
+	}
+
 	// 3. Simulate sending an email.
 	amountDollars := float64(event.Amount) / 100.0
 	log.Printf("[Notification] Sent email to %s for Order #%s. Amount: $%.2f. Status: %s",

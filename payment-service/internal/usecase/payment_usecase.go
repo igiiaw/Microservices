@@ -1,22 +1,23 @@
 package usecase
 
 import (
+	"log"
+
 	"github.com/google/uuid"
 
 	"payment-service/internal/domain"
 )
 
-// PaymentUseCase handles payment processing — generates IDs, applies domain rules, saves
 type PaymentUseCase struct {
-	repo domain.PaymentRepository
+	repo      domain.PaymentRepository
+	publisher domain.EventPublisher // Optional; nil disables events
 }
 
-func NewPaymentUseCase(repo domain.PaymentRepository) *PaymentUseCase {
-	return &PaymentUseCase{repo: repo}
+func NewPaymentUseCase(repo domain.PaymentRepository, publisher domain.EventPublisher) *PaymentUseCase {
+	return &PaymentUseCase{repo: repo, publisher: publisher}
 }
 
-// ProcessPayment runs the limit check (via domain.NewPayment) and persists the result
-func (uc *PaymentUseCase) ProcessPayment(orderID string, amount int64) (*domain.Payment, error) {
+func (uc *PaymentUseCase) ProcessPayment(orderID string, amount int64, customerEmail string) (*domain.Payment, error) {
 	payment := domain.NewPayment(orderID, amount)
 	payment.ID = uuid.New().String()
 	payment.TransactionID = uuid.New().String()
@@ -24,16 +25,27 @@ func (uc *PaymentUseCase) ProcessPayment(orderID string, amount int64) (*domain.
 	if err := uc.repo.Save(payment); err != nil {
 		return nil, err
 	}
+
+	// Best-effort notification. If publishing fails, the payment stays saved.
+	if uc.publisher != nil {
+		event := domain.PaymentCompletedEvent{
+			OrderID:       payment.OrderID,
+			Amount:        payment.Amount,
+			CustomerEmail: customerEmail,
+			Status:        payment.Status,
+		}
+		if err := uc.publisher.PublishPaymentCompleted(event); err != nil {
+			log.Printf("WARNING: failed to publish payment.completed event: %v", err)
+		}
+	}
+
 	return payment, nil
 }
 
-// GetPaymentByOrderID fetches the stored payment for a given order
 func (uc *PaymentUseCase) GetPaymentByOrderID(orderID string) (*domain.Payment, error) {
 	return uc.repo.FindByOrderID(orderID)
 }
 
-// ListPaymentsByStatus returns payments filtered by status.
-// the gRPC handler validates the status value before calling this — we trust it here
 func (uc *PaymentUseCase) ListPaymentsByStatus(status string) ([]*domain.Payment, error) {
 	return uc.repo.ListByStatus(status)
 }

@@ -10,7 +10,7 @@ import (
 	"payment-service/internal/usecase"
 )
 
-// PaymentHandler is the thin delivery layer for the Payment Service.
+// PaymentHandler is the HTTP layer — parse, call use case, respond. No logic here.
 type PaymentHandler struct {
 	uc *usecase.PaymentUseCase
 }
@@ -37,14 +37,15 @@ func (h *PaymentHandler) ProcessPayment(c *gin.Context) {
 		return
 	}
 
-	payment, err := h.uc.ProcessPayment(req.OrderID, req.Amount)
+	email := "customer_" + req.OrderID[:8] + "@example.com"
+	payment, err := h.uc.ProcessPayment(req.OrderID, req.Amount, email)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Return 201 for both Authorized and Declined so the Order Service can
-	// inspect the "status" field without treating a Declined as a transport error.
+	// 201 for both Authorized and Declined — Order Service checks the status field,
+	// a Declined isn't a transport-level error
 	c.JSON(http.StatusCreated, payment)
 }
 

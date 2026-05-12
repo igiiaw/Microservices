@@ -35,9 +35,11 @@ func (s *PaymentServer) ProcessPayment(
 		return nil, status.Error(codes.InvalidArgument, "amount must be > 0")
 	}
 
-	p, err := s.uc.ProcessPayment(req.GetOrderId(), req.GetAmount())
+	// Mock email for the demo. In prod, fetch from User Service or request.
+	email := "customer_" + req.GetOrderId()[:8] + "@example.com"
+
+	p, err := s.uc.ProcessPayment(req.GetOrderId(), req.GetAmount(), email)
 	if err != nil {
-		// only real infra errors land here — "amount > limit → Declined" is a success, not an error
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 

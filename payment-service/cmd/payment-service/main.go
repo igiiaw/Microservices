@@ -1,19 +1,25 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 
 	paymentv1 "github.com/igiiaw/ap2-proto-gen/gen/go/payment/v1"
-	"google.golang.org/grpc/reflection"
+	"payment-service/internal/messaging/rabbitmq"
 	pgRepo "payment-service/internal/repository/postgres"
 	transportGRPC "payment-service/internal/transport/grpc"
 	transportHTTP "payment-service/internal/transport/http"
@@ -21,7 +27,7 @@ import (
 )
 
 func main() {
-	// ── Database ──────────────────────────────────────────────────────────────
+	// Database setup
 	dsn := fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		getEnv("DB_HOST", "localhost"),
@@ -41,7 +47,7 @@ func main() {
 		if err = db.Ping(); err == nil {
 			break
 		}
-		log.Printf("[%d/12] waiting for payments-db…", i)
+		log.Printf("[%d/12] waiting for payments-db...", i)
 		time.Sleep(3 * time.Second)
 	}
 	if err != nil {
@@ -49,49 +55,103 @@ func main() {
 	}
 	log.Println("Connected to payments-db")
 
-	// ── Migrations ────────────────────────────────────────────────────────────
+	// Run migrations
 	if err := runMigrations(db); err != nil {
 		log.Fatalf("migration failed: %v", err)
 	}
 
-	// ── Composition Root (manual DI) ──────────────────────────────────────────
-	paymentRepo := pgRepo.NewPaymentRepository(db)
-	paymentUseCase := usecase.NewPaymentUseCase(paymentRepo)
+	// RabbitMQ setup
+	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
-	// HTTP delivery (kept for backwards-compat during migration) ─────────────
+	var rabbitConn *amqp.Connection
+	for i := 1; i <= 12; i++ {
+		rabbitConn, err = amqp.Dial(rabbitURL)
+		if err == nil {
+			break
+		}
+		log.Printf("[%d/12] waiting for RabbitMQ...", i)
+		time.Sleep(3 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("RabbitMQ not reachable: %v", err)
+	}
+	defer rabbitConn.Close()
+	log.Println("Connected to RabbitMQ")
+
+	rabbitCh, err := rabbitConn.Channel()
+	if err != nil {
+		log.Fatalf("failed to open RabbitMQ channel: %v", err)
+	}
+	defer rabbitCh.Close()
+
+	publisher, err := rabbitmq.NewPublisher(rabbitCh)
+	if err != nil {
+		log.Fatalf("failed to create publisher: %v", err)
+	}
+
+	// Dependency Injection
+	paymentRepo := pgRepo.NewPaymentRepository(db)
+	paymentUseCase := usecase.NewPaymentUseCase(paymentRepo, publisher)
+
+	// HTTP Server
 	httpHandler := transportHTTP.NewPaymentHandler(paymentUseCase)
 	router := gin.Default()
 	httpHandler.RegisterRoutes(router)
 
 	httpPort := getEnv("PORT", "8081")
+	httpServer := &http.Server{
+		Addr:    ":" + httpPort,
+		Handler: router,
+	}
 	go func() {
 		log.Printf("Payment Service HTTP listening on :%s", httpPort)
-		if err := router.Run(":" + httpPort); err != nil {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http server error: %v", err)
 		}
 	}()
 
-	// gRPC delivery ───────────────────────────────────────────────────────────
+	// gRPC Server
 	grpcPort := getEnv("GRPC_PORT", "9091")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
 		log.Fatalf("failed to listen on :%s: %v", grpcPort, err)
 	}
 
-	// Logging interceptor added here
 	grpcServer := grpc.NewServer(
 		grpc.UnaryInterceptor(transportGRPC.LoggingUnaryInterceptor),
 	)
 	paymentv1.RegisterPaymentServiceServer(grpcServer, transportGRPC.NewPaymentServer(paymentUseCase))
 	reflection.Register(grpcServer)
 
-	log.Printf("Payment Service gRPC listening on :%s", grpcPort)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("grpc server error: %v", err)
+	go func() {
+		log.Printf("Payment Service gRPC listening on :%s", grpcPort)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("grpc server error: %v", err)
+		}
+	}()
+
+	// Graceful Shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	log.Printf("Received %s, shutting down...", sig)
+
+	// 1. Stop gRPC server gracefully
+	grpcServer.GracefulStop()
+	log.Println("gRPC server stopped")
+
+	// 2. Stop HTTP server with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server forced shutdown: %v", err)
 	}
+	log.Println("HTTP server stopped")
+
+	// 3 & 4. RabbitMQ and DB close automatically via defers above
+	log.Println("Payment Service shutdown complete")
 }
 
-// getEnv is a helper function to read an environment variable or return a default value
 func getEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
@@ -99,16 +159,16 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// runMigrations applies schema changes idempotently.
+// runMigrations ensures the payments table exists.
 func runMigrations(db *sql.DB) error {
 	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS payments (
-			id             VARCHAR(36)  PRIMARY KEY,
-			order_id       VARCHAR(36)  NOT NULL,
-			transaction_id VARCHAR(36)  NOT NULL,
-			amount         BIGINT       NOT NULL CHECK (amount > 0),
-			status         VARCHAR(50)  NOT NULL
-		);
-	`)
+        CREATE TABLE IF NOT EXISTS payments (
+            id             VARCHAR(36)  PRIMARY KEY,
+            order_id       VARCHAR(36)  NOT NULL,
+            transaction_id VARCHAR(36)  NOT NULL,
+            amount         BIGINT       NOT NULL CHECK (amount > 0),
+            status         VARCHAR(50)  NOT NULL
+        );
+    `)
 	return err
 }
